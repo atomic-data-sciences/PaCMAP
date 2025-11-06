@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import time
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numba
 
@@ -13,13 +14,213 @@ from sklearn.base import BaseEstimator
 from sklearn.decomposition import TruncatedSVD, PCA
 from sklearn.utils.validation import check_is_fitted
 from sklearn import preprocessing
-from annoy import AnnoyIndex
-from typing import Optional
+
+import faiss
 
 global _RANDOM_STATE
 _RANDOM_STATE = None
 
 logger = logging.getLogger(__name__)
+
+
+def _angular_distance(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    """Compute angular (cosine) distance."""
+    norm1 = np.maximum(np.linalg.norm(vec1), 1e-20)
+    norm2 = np.maximum(np.linalg.norm(vec2), 1e-20)
+    cosine_sim = np.dot(vec1, vec2) / (norm1 * norm2)
+    cosine_sim = np.clip(cosine_sim, -1.0, 1.0)
+    return math.sqrt(max(0.0, 2.0 - 2.0 * cosine_sim))
+
+
+def _hamming_distance(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    """Compute Hamming distance treating inputs as binary vectors."""
+    return float(np.count_nonzero(vec1 != vec2))
+
+
+class FaissIndex:
+    """Provide an Annoy-like API backed by FAISS."""
+
+    def __init__(self, dim: int, metric: str = "euclidean"):
+        self.dim = dim
+        self.metric = metric
+        self.seed: Optional[int] = None
+        self._vectors: Dict[int, np.ndarray] = {}
+        self._order: List[int] = []
+        self._index: Optional[faiss.Index] = None
+        self._data_matrix: Optional[np.ndarray] = None
+        self._normalized_matrix: Optional[np.ndarray] = None
+
+    def _ensure_vector(self, vector: Sequence[float]) -> np.ndarray:
+        arr = np.asarray(vector, dtype=np.float32)
+        if arr.shape != (self.dim,):
+            raise ValueError(f"Vector has shape {arr.shape}, expected ({self.dim},)")
+        return arr
+
+    def set_seed(self, seed: int) -> None:
+        self.seed = seed
+        np.random.seed(seed)
+
+    def add_item(self, idx: int, vector: Sequence[float]) -> None:
+        vec = self._ensure_vector(vector)
+        self._vectors[idx] = vec
+        if idx not in self._order:
+            self._order.append(idx)
+
+    def _build_faiss_index(self) -> Optional[faiss.Index]:
+        if not self._order:
+            return None
+        self._order.sort()
+        self._data_matrix = np.vstack([self._vectors[idx] for idx in self._order]).astype(np.float32)
+
+        metric = self.metric.lower()
+        if metric == "euclidean":
+            index = faiss.IndexFlatL2(self.dim)
+            index.add(self._data_matrix)
+            self._normalized_matrix = None
+            return index
+        if metric == "manhattan":
+            index = faiss.IndexFlat(self.dim, faiss.METRIC_L1)
+            index.add(self._data_matrix)
+            self._normalized_matrix = None
+            return index
+        if metric == "dot":
+            index = faiss.IndexFlatIP(self.dim)
+            index.add(self._data_matrix)
+            self._normalized_matrix = None
+            return index
+        if metric == "angular":
+            index = faiss.IndexFlatIP(self.dim)
+            norms = np.linalg.norm(self._data_matrix, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-12)
+            self._normalized_matrix = self._data_matrix / norms
+            index.add(self._normalized_matrix)
+            return index
+        # For hamming and unsupported metrics we will fall back to brute-force.
+        self._normalized_matrix = None
+        return None
+
+    def build(self, _n_trees: int = 10) -> None:
+        self._index = self._build_faiss_index()
+
+    def _metric_function(self):
+        metric = self.metric.lower()
+        if metric == "euclidean":
+            return lambda v1, v2: float(np.linalg.norm(v1 - v2))
+        if metric == "manhattan":
+            return lambda v1, v2: float(np.sum(np.abs(v1 - v2)))
+        if metric == "angular":
+            return lambda v1, v2: _angular_distance(v1, v2)
+        if metric == "hamming":
+            return lambda v1, v2: _hamming_distance(v1, v2)
+        if metric == "dot":
+            return lambda v1, v2: float(np.dot(v1, v2))
+        raise NotImplementedError(f"Unsupported distance metric: {self.metric}")
+
+    def _postprocess_distances(
+        self,
+        raw_distances: np.ndarray,
+        query_vector: np.ndarray,
+        mapped_indices: np.ndarray
+    ) -> np.ndarray:
+        metric = self.metric.lower()
+        if metric == "euclidean":
+            return np.sqrt(np.maximum(raw_distances, 0.0)).astype(np.float32)
+        if metric == "manhattan":
+            return raw_distances.astype(np.float32)
+        if metric == "angular":
+            cos_sim = np.clip(raw_distances, -1.0, 1.0)
+            angular = np.sqrt(np.maximum(2.0 - 2.0 * cos_sim, 0.0))
+            return angular.astype(np.float32)
+        if metric == "hamming":
+            distances = [_hamming_distance(query_vector, self._vectors[idx]) for idx in mapped_indices]
+            return np.asarray(distances, dtype=np.float32)
+        if metric == "dot":
+            return raw_distances.astype(np.float32)
+        raise NotImplementedError(f"Unsupported distance metric: {self.metric}")
+
+    def _faiss_search(self, vector: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        metric = self.metric.lower()
+        if self._index is None or metric == "hamming":
+            raise RuntimeError("FAISS index is not available for the requested metric.")
+        query = vector.reshape(1, -1).astype(np.float32)
+        if metric == "angular":
+            norm = np.linalg.norm(query, axis=1, keepdims=True)
+            norm = np.maximum(norm, 1e-12)
+            query = query / norm
+        distances, indices = self._index.search(query, min(k, len(self._order)))
+        indices = indices[0]
+        distances = distances[0]
+        valid = indices != -1
+        indices = indices[valid]
+        distances = distances[valid]
+        mapped = np.array([self._order[i] for i in indices], dtype=np.int32)
+        processed = self._postprocess_distances(distances, vector, mapped)
+        return mapped, processed
+
+    def _brute_force_search(self, vector: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        data = self._data_matrix
+        if data is None:
+            data = np.vstack([self._vectors[idx] for idx in self._order]).astype(np.float32)
+        metric_fn = self._metric_function()
+        dist_vals = np.array([metric_fn(vector, data[i]) for i in range(data.shape[0])], dtype=np.float32)
+        order = np.argsort(dist_vals)[:k]
+        mapped = np.array([self._order[i] for i in order], dtype=np.int32)
+        return mapped, dist_vals[order]
+
+    def _search(self, vector: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        if not self._order:
+            return np.empty((0,), dtype=np.int32), np.empty((0,), dtype=np.float32)
+        metric = self.metric.lower()
+        if self._index is not None and metric != "hamming":
+            return self._faiss_search(vector, k)
+        return self._brute_force_search(vector, k)
+
+    def get_nns_by_vector(self, vector: Sequence[float], n: int, include_distances: bool = False):
+        vec = self._ensure_vector(vector)
+        indices, distances = self._search(vec, n)
+        if include_distances:
+            return indices.tolist(), distances.tolist()
+        return indices.tolist()
+
+    def get_nns_by_item(self, idx: int, n: int, include_distances: bool = False):
+        if idx not in self._vectors:
+            raise IndexError(f"Index {idx} not found in FAISS index.")
+        vector = self._vectors[idx]
+        indices, distances = self._search(vector, n)
+        if include_distances:
+            return indices.tolist(), distances.tolist()
+        return indices.tolist()
+
+    def get_distance(self, idx1: int, idx2: int) -> float:
+        if idx1 not in self._vectors or idx2 not in self._vectors:
+            raise IndexError("Indices must exist in the index.")
+        vec1 = self._vectors[idx1]
+        vec2 = self._vectors[idx2]
+        return self._metric_function()(vec1, vec2)
+
+    def get_n_items(self) -> int:
+        return len(self._order)
+
+    def save(self, path: str) -> bool:
+        payload = {
+            "dim": self.dim,
+            "metric": self.metric,
+            "order": self._order,
+            "vectors": [self._vectors[idx] for idx in self._order],
+        }
+        with open(path, "wb") as fh:
+            pkl.dump(payload, fh)
+        return True
+
+    @classmethod
+    def from_file(cls, path: str) -> "FaissIndex":
+        with open(path, "rb") as fh:
+            payload = pkl.load(fh)
+        instance = cls(payload["dim"], payload["metric"])
+        for idx, vec in zip(payload["order"], payload["vectors"]):
+            instance.add_item(int(idx), np.asarray(vec, dtype=np.float32))
+        instance.build()
+        return instance
 
 
 @numba.njit("f4(f4[:])", cache=True)
@@ -423,7 +624,7 @@ def print_verbose(msg, verbose, **kwargs):
 def generate_extra_pair_basis(basis,
                               X,
                               n_neighbors,
-                              tree: AnnoyIndex,
+                              tree: Optional[FaissIndex],
                               distance='euclidean',
                               verbose=True
                               ):
@@ -431,18 +632,18 @@ def generate_extra_pair_basis(basis,
     '''
     npr, dimp = X.shape
 
-    assert (basis is not None or tree is not None), "If the annoyindex is not cached, the original dataset must be provided."
+    assert (basis is not None or tree is not None), "If the index is not cached, the original dataset must be provided."
 
     # Build the tree again if not cached
     if tree is None:
         n, dim = basis.shape
         assert dimp == dim, "The dimension of the original dataset is different from the new one's."
-        tree = AnnoyIndex(dim, metric=distance)
+        tree = FaissIndex(dim, metric=distance)
         if _RANDOM_STATE is not None:
             tree.set_seed(_RANDOM_STATE)
         for i in range(n):
             tree.add_item(i, basis[i, :])
-        tree.build(20)
+        tree.build()
     else:
         n = tree.get_n_items()
 
@@ -497,12 +698,12 @@ def generate_pair(
         self.n_MN = int(n / ( 1 + self.MN_ratio + self.FP_ratio) * self.MN_ratio)
         self.n_FP = int(n / ( 1 + self.MN_ratio + self.FP_ratio) * self.FP_ratio)
     
-    tree = AnnoyIndex(dim, metric=distance)
+    tree = FaissIndex(dim, metric=distance)
     if _RANDOM_STATE is not None:
         tree.set_seed(_RANDOM_STATE)
     for i in range(n):
         tree.add_item(i, X[i, :])
-    tree.build(20)
+    tree.build()
 
     option = distance_to_option(distance=distance)
 
@@ -724,17 +925,17 @@ def save(instance, common_prefix: str):
     '''
     Save PaCMAP instance to a location specified by the user.
 
-    PaCMAP use ANNOY for graph construction, which cannot be pickled. We provide
-    this function as an alternative to save a PaCMAP instance by storing the
-    ANNOY instance and other parts of PaCMAP separately.
+    PaCMAP uses a FAISS-backed index for graph construction, which cannot be
+    pickled directly. We provide this function as an alternative to save a
+    PaCMAP instance by storing the index and other parts of PaCMAP separately.
     '''
     extra_info = ""
     if instance.save_tree:
-        # Save the AnnoyIndex
+        # Save the FAISS index
         instance.tree.save(f"{common_prefix}.ann")
         temp_tree = instance.tree
         instance.tree = None  # Remove the tree for pickle
-        extra_info = f", and the Annoy Index is saved at {common_prefix}.ann"
+        extra_info = f", and the FAISS index is saved at {common_prefix}.ann"
 
     # Save the other parts
     with open(f"{common_prefix}.pkl", "wb") as fp:
@@ -744,14 +945,13 @@ def save(instance, common_prefix: str):
     print(f"To load the instance again, please do `pacmap.load({common_prefix})`.")
 
     if instance.save_tree:
-        # Reload the AnnoyIndex
-        instance.tree = temp_tree  # reload the annoy index
+        # Reload the FAISS index
+        instance.tree = temp_tree
         assert instance.tree is not None
 
 
 def attach_index(reducer, index_path: str):
-    reducer.tree = AnnoyIndex(reducer.num_dimensions, reducer.distance)
-    reducer.tree.load(index_path)  # mmap the file
+    reducer.tree = FaissIndex.from_file(index_path)
     return reducer
 
 
@@ -850,7 +1050,7 @@ class PaCMAP(BaseEstimator):
         Setting random state is useful for repeatability.
 
     save_tree: bool, default=False
-        Whether to save the annoy index tree after finding the nearest neighbor pairs.
+        Whether to save the FAISS index after finding the nearest neighbor pairs.
         Default to False for memory saving. Setting this option to True can make `transform()` method faster.
     '''
 
@@ -905,10 +1105,10 @@ class PaCMAP(BaseEstimator):
             _RANDOM_STATE = None  # Reset random state
 
         # Raise error on initialization with an incorrect distance metric.
-        VALID_ANNOY_METRICS = {"angular", "euclidean", "manhattan", "hamming", "dot"}
-        if self.distance not in VALID_ANNOY_METRICS:
+        VALID_FAISS_METRICS = {"angular", "euclidean", "manhattan", "hamming", "dot"}
+        if self.distance not in VALID_FAISS_METRICS:
             raise NotImplementedError(
-                "`distance` must be one of {}".format(", ".join(VALID_ANNOY_METRICS))
+                "`distance` must be one of {}".format(", ".join(VALID_FAISS_METRICS))
             )
 
         if self.n_components < 1:
@@ -924,7 +1124,7 @@ class PaCMAP(BaseEstimator):
                 "apply_pca = True for Hamming distance. This option will be ignored.")
         if not self.apply_pca:
             logger.warning(
-                "Running ANNOY Indexing on high-dimensional data. Nearest-neighbor search may be slow!")
+                "Running FAISS indexing on high-dimensional data. Nearest-neighbor search may be slow!")
 
     def decide_num_pairs(self, n):
         if self.n_neighbors is None:
@@ -1076,7 +1276,7 @@ class PaCMAP(BaseEstimator):
 
         basis: numpy.ndarray
             The original dataset that have already been applied during the `fit` or `fit_transform` process.
-            If `save_tree == False`, then the basis is required to reconstruct the ANNOY tree instance.
+            If `save_tree == False`, then the basis is required to reconstruct the FAISS index instance.
             If `save_tree == True`, then it's unnecessary to provide the original dataset again.
 
         init: str, optional
@@ -1134,7 +1334,7 @@ class PaCMAP(BaseEstimator):
             The high-dimensional dataset that is being projected.
 
         save_tree: bool
-            Whether to save the annoy index tree after finding the nearest neighbor pairs.
+            Whether to save the FAISS index after finding the nearest neighbor pairs.
         '''
         # Creating pairs
         print_verbose("Finding pairs", self.verbose)
@@ -1431,7 +1631,7 @@ class LocalMAP(PaCMAP):
         Setting random state is useful for repeatability.
 
     save_tree: bool, default=False
-        Whether to save the annoy index tree after finding the nearest neighbor pairs.
+        Whether to save the FAISS index after finding the nearest neighbor pairs.
         Default to False for memory saving. Setting this option to True can make `transform()` method faster.
     
     low_dist_thres [NEW FOR LocalMAP]: float, default=10
